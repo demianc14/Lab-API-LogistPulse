@@ -11,7 +11,7 @@
       "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [ { "refId": "A", "expr": "rate(logistpulse_orders_dispatched_total[1m]) * 60", "legendFormat": "despachados" },
-                   { "refId": "B", "expr": "rate(logistpulse_orders_created_total[1m]) * 60", "legendFormat": "creados" } ]
+                   { "refId": "B", "expr": "rate(logistpulse_orders_total[1m]) * 60", "legendFormat": "creados" } ]
     },
     {
       "id": 2, "type": "stat", "title": "AMR libres",
@@ -42,6 +42,21 @@
       "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [ { "refId": "A", "expr": "sum(jvm_memory_used_bytes{area=\"heap\"}) / 1024 / 1024", "legendFormat": "heap" } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Latencia p95 HTTP (s)",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri=~\"/api/.*\"}[1m])))", "legendFormat": "p95 /api/**" },
+                   { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri=\"/api/orders/{id}/dispatch\"}[1m])))", "legendFormat": "p95 dispatch" } ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Outbox: eventos pendientes y antigüedad (s)",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "logistpulse_outbox_pending", "legendFormat": "pendientes" },
+                   { "refId": "B", "expr": "logistpulse_outbox_oldest_pending_seconds", "legendFormat": "el más antiguo (s)" } ]
     }
   ]
 }

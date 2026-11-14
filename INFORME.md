@@ -203,9 +203,11 @@ El ETA puede quedar algo desfasado respecto al momento del commit. El despacho s
 
 ## Parte 7 · Mensajería, consistencia y Outbox
 
-**⚠ Lo que NO pude hacer: 7.1 y 7.2 en vivo.** Intenté levantar RabbitMQ con la imagen local `rabbitmq:3.13-management` (la del compose, `rabbitmq:4-management`, no está descargada y no quise bajarla)
-y el contenedor se detenía al arrancar con `Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces` (permisos del volumen en este Docker/OrbStack). Probé 3 variantes (cookie por variable, `tmpfs` con uid 999) con el mismo resultado.
-Por eso **no observé** el log `Flota recibió …` ni la cola `orders.dispatched` en la consola 15672, ni la acumulación de mensajes con el consumidor parado. Todo lo de esta parte se verificó en Modo A y con tests, no contra un broker real.
+**Actualización (hecha durante la Parte 8, con el stack Docker completo):** al principio no pude levantar RabbitMQ (la imagen local `rabbitmq:3.13-management` fallaba con
+`Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces`, 3 variantes probadas), así que verifiqué esta parte en Modo A y con tests. Más tarde `docker compose up` con `rabbitmq:4-management` (4.4.0) sí arrancó, y comprobé en vivo:
+- Flujo real: `dispatch` → log `Evento order.dispatched publicado id=1` (OutboxPublisher) → `Flota recibió order.dispatched id=1` → `Pedido 1 → IN_TRANSIT`; la cola `orders.dispatched` quedó con 0 listos / 0 sin confirmar y 1 consumidor.
+- **Duplicado (7.5):** publiqué otra vez el mensaje `1` desde la API de gestión de RabbitMQ (`routed: true`): el log dijo `Mensaje duplicado u obsoleto para el pedido 1 (ya no está DISPATCHED): se ignora`, el pedido siguió en `IN_TRANSIT` y la cola quedó en 0 (no se reencoló).
+- Sigue **sin** observarse 7.2 (parar el consumidor y ver acumularse mensajes); no lo repetí.
 
 **Qué cambié:**
 - `OutboxEvent` + `OutboxEventRepository` (tabla `outbox_event`: `type`, `payload`, `createdAt`, `sentAt` nulo hasta publicar).
@@ -227,7 +229,7 @@ las filas enviadas nunca se purgan (la tabla crece); no hay confirmaciones del p
 
 **★ 7.5 Idempotencia: ¿qué pasa hoy si llega dos veces el mismo mensaje?**
 - El código original llamaba a `transition(id, IN_TRANSIT)`. La segunda vez el pedido ya está `IN_TRANSIT`, `canGoTo(IN_TRANSIT)` es falso (comprobado en `OrderStatusTest`: ningún estado se transita a sí mismo) y lanza `ApiException(409)` desde el listener.
-  Con la configuración por defecto de Spring AMQP, una excepción en el listener hace que el mensaje se **reencole y se reintente sin fin** (esto lo deduzco del comportamiento por defecto; **no lo observé** sin broker).
+  Con la configuración por defecto de Spring AMQP, una excepción en el listener hace que el mensaje se **reencole y se reintente sin fin** (esto lo deduzco del comportamiento por defecto de Spring AMQP; **no observé el antes**, solo comprobé que con la guarda el duplicado se ignora).
 - Ahora `startTransit` solo actúa si el estado es `DISPATCHED`; un duplicado devuelve `false`, se registra y se confirma. La guarda también protege de un mensaje obsoleto: sin ella, un pedido `DELIVERED` podría volver a `IN_TRANSIT`
   (el test falla si quito la guarda; lo comprobé).
 - Si dos consumidores procesan el mismo mensaje a la vez, el `@Version` hace fallar a uno; esa excepción no se captura a propósito: el broker reentrega y el reintento ya ve el estado final (→ "ignorado").
@@ -237,4 +239,51 @@ las filas enviadas nunca se purgan (la tabla crece); no hay confirmaciones del p
 `FleetListenerIdempotencyTest` (4), `DispatchOutboxTest` (2, con Spring + H2: un despacho exitoso crea un evento; los despachos rechazados —ya despachado, sin AMR— no crean ninguno).
 Nota: la primera versión de la prueba de integración se llamaba `…IT` y Surefire no la ejecutaba; la renombré a `…Test` y la corrí.
 
-**Qué no hice:** ver 7.1/7.2 con RabbitMQ real; probar el Outbox contra un broker (solo con mocks y modo lite); un test de que el evento se revierte si la transacción falla *después* del insert; purga de eventos enviados.
+**Qué no hice:** 7.2 (consumidor parado y mensajes acumulándose); ver el "antes" del duplicado (bucle de reencolado); un test de que el evento se revierte si la transacción falla *después* del insert; purga de eventos enviados.
+
+## Parte 8 · Observabilidad y "guerra de resiliencia"
+
+**Entorno:** stack completo con `docker compose up -d --build` (Postgres 17, Redis 7, RabbitMQ 4.4.0, WireMock, API, Prometheus 3.0.1, Grafana 11.4.0), usando una **copia del compose** (fuera del repo) que publica la API en el **8081**,
+porque otro contenedor mío ocupa 127.0.0.1:8080. Grafana en `localhost:3000`, Prometheus en `localhost:9090`.
+No hice capturas de pantalla de Grafana: las cifras de abajo salen de consultas a la API de Prometheus y de scripts con tiempos; las capturas hay que tomarlas a mano.
+
+**Hallazgos previos (cambian lo que dice LAB.md):**
+1. **No existía `http_server_requests_*`.** Spring Boot 4.1 no registra métricas HTTP de servidor para Jersey (solo `http_client_requests`), así que el panel 5 del dashboard y el 8.4 no podían funcionar.
+   Solución: `HttpMetricsFilter` (filtro Jersey) que registra el `Timer` `http.server.requests` con `method`, `uri` (normalizada: `/api/orders/{id}`), `status`, `outcome`; más la propiedad
+   `management.metrics.distribution.percentiles-histogram.http.server.requests=true`. Verificado: 138 series de buckets en `/actuator/prometheus`.
+2. **El panel 1 consultaba una serie inexistente** (`logistpulse_orders_created_total`; Prometheus reserva el sufijo `_created`, el contador se expone como `logistpulse_orders_total`). Lo corregí en `logistpulse.json`.
+
+**8.1 / 8.2 Carga y flota agotada:** 40 pedidos con el comando del LAB (43 en total). Despachando seguidos, los 3 primeros dieron `200` (AMR-02, 03, 04, con AMR-01 ya ocupado) y los siguientes (pedidos 5–12) **`409 "No hay AMR disponible (libre y con batería ≥ 20%)"`**.
+★ **¿Qué estado HTTP y qué panel lo muestra?** `409 Conflict`. Lo muestra "HTTP: peticiones/s por estado" (serie `status=409`, que antes del arreglo 1 estaba vacío) y "AMR en misión". Prometheus dio `logistpulse_robots_busy = 4`.
+Observación: **"AMR libres" marcó 1** aunque ninguno era despachable: AMR-05 estaba `IDLE` con 15 % de batería. El panel engaña, porque cuenta libres sin mirar el umbral `MIN_BATTERY`. Tras `POST /api/robots/5/charge` (batería 100) el despacho funcionó (`200`).
+
+**8.3 Caos** (un servicio cada vez; tiempos medidos con script, 1 ejecución cada uno):
+| Servicio parado | Qué ocurre | Cuánto tarda en recuperarse |
+|---|---|---|
+| **RabbitMQ** | `dispatch` sigue en `200` (0,28 s) gracias al Outbox; `health` → `503` (`rabbit: DOWN`); el pedido se queda `DISPATCHED`; el log avisa `Outbox: no se pudo publicar…` una vez por segundo (10 avisos en ~9 s) | pedido a `IN_TRANSIT` **4,2 s** después de arrancar el broker |
+| **Redis** | `/api/routes`, `/actuator/health` y `dispatch` se **cuelgan 60 s** y luego `500` / `503` (`redis: DOWN`); `/api/robots` (no usa caché) sigue en `200` en 0,02 s | rutas OK **9,7 s** después de arrancar Redis |
+| **WireMock (transportista)** | `dispatch` `200` en 0,14 s con ETA de respaldo (30 = coste 15 × 2); `health` sigue `UP` (no hay indicador del transportista); solo queda un `WARN` en el log | ETA del transportista (25) de nuevo **1,4 s** después de arrancar |
+| **Postgres** | `/actuator/health` → `503` a los 30 s; `/api/robots` → `500` a los 30 s; **`/actuator/prometheus` tarda 60 s** → Prometheus (timeout de scrape 5 s) pierde la API: `min_over_time(up[20m]) = 0` | `/api/robots` `200` **8,3 s** después de arrancar Postgres |
+Sobre los paneles: lo anterior lo vi por métricas y logs, **no** comprobé visualmente qué panel cambió en Grafana. Con las métricas de HTTP corregidas deberían verse los `5xx` en "HTTP: peticiones/s por estado".
+
+**Problemas que destapó el caos (no corregidos, salvo indicación):**
+- **Monitoreo ciego cuando cae la BD:** `FleetMetrics` calcula los gauges `robots_idle/busy` con una consulta SQL **en cada scrape**; sin BD, cada gauge espera 30 s (pool) y el scrape tarda 60 s. Arreglo propuesto (no hecho): refrescarlos periódicamente en memoria, como hice con las métricas del Outbox.
+- **Redis es dependencia dura:** sin Redis la caché lanza error en vez de degradar (se pierde el despacho). Propuesta: un `CacheErrorHandler` que ignore los fallos de caché y calcule la ruta. Además `dispatch` llama a `planner.plan` **dentro** de la transacción, así que con Redis caído retendría una conexión de la pool hasta 60 s: es la misma trampa de la Parte 6 (lo deduzco; no medí el agotamiento de la pool).
+- El transportista caído solo deja un `WARN`: ni métrica ni panel ni `health`.
+
+**8.4 Panel p95:** `Latencia p95 HTTP (s)` (id 7) en `infra/grafana/dashboards/logistpulse.json`, con `histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri=~"/api/.*"}[1m])))` y una serie solo para `dispatch`.
+Con mi tráfico: p95 de `dispatch` = **0,33 s**, p95 de `/api/**` = 0,15 s (esta segunda de una muestra pequeña, sin las lecturas de `/api/orders`, que mi script no llegó a ejecutar por un error de comillas en zsh). Grafana cargó el dashboard con 8 paneles.
+Añadí también el panel 8 "Outbox: eventos pendientes y antigüedad" y las métricas `logistpulse_outbox_pending` y `logistpulse_outbox_oldest_pending_seconds` (calculadas en cada pasada de `OutboxPublisher`, sin consultar la BD en el scrape).
+Verificado con RabbitMQ parado: pendientes = 1 y antigüedad 17 s → 27 s; al arrancarlo, 0.
+
+**★ 8.5 Tres SLOs y su PromQL** (las tres consultas se ejecutan en Prometheus; los resultados son con mi tráfico de prueba, no una medición de 30 días):
+1. **Disponibilidad del despacho ≥ 99,5 % (30 días).** Cuentan como fallo solo los `5xx`; un `409` (sin AMR, estado ilegal) o `404` es un rechazo correcto, no indisponibilidad.
+   `1 - ((sum(rate(http_server_requests_seconds_count{uri="/api/orders/{id}/dispatch",status=~"5.."}[30d])) or vector(0)) / sum(rate(http_server_requests_seconds_count{uri="/api/orders/{id}/dispatch"}[30d])))` → con ventana de 1 h dio 1,0.
+2. **Latencia p95 del despacho ≤ 500 ms.** `histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/api/orders/{id}/dispatch"}[5m]))) <= 0.5` → 0,32 s. El umbral sale de lo medido (~0,3 s con el transportista normal, que responde en ~120 ms);
+   un transportista lento (corte a 2 s) lo incumpliría, que es justo lo que debe detectar.
+3. **Tiempo máximo en `DISPATCHED` ≤ 60 s.** Proxy: `max_over_time(logistpulse_outbox_oldest_pending_seconds[5m]) <= 60` → 27 s en el corte de RabbitMQ.
+   **Limitación importante:** mide solo el retraso del lado del Outbox. Si el consumidor muere con el Outbox vacío, los pedidos se quedarían en `DISPATCHED` y este SLO seguiría "verde". La medida exacta requeriría guardar `dispatchedAt` en el pedido o un gauge por estado
+   (`logistpulse_orders_by_status`, el reto 8.6), que **no implementé**.
+
+**Qué no hice:** el reto 8.6 (gauge por estado y alerta "AMR libres = 0 durante 1 min"); arreglar `FleetMetrics` y el `CacheErrorHandler`; capturas de Grafana; repetir cada caos más de una vez; ver Grafana (solo comprobé por su API que cargó los 8 paneles).
+`mvn test`: **36 tests, 0 fallos** (+2 del Outbox, +2 de `HttpMetricsFilter`).

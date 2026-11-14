@@ -2,8 +2,12 @@ package com.logistpulse.lab.messaging;
 
 import com.logistpulse.lab.domain.OutboxEvent;
 import com.logistpulse.lab.repo.OutboxEventRepository;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -29,13 +33,21 @@ public class OutboxPublisher {
     private final OutboxEventRepository outbox;
     private final boolean enabled;
     private final ObjectProvider<RabbitTemplate> rabbit;
+    // Se actualizan en cada pasada: el scrape de Prometheus no toca la base de datos.
+    private final AtomicLong pendingCount = new AtomicLong();
+    private final AtomicLong oldestPendingSeconds = new AtomicLong();
 
     public OutboxPublisher(OutboxEventRepository outbox,
                            @Value("${lab.messaging.enabled:false}") boolean enabled,
-                           ObjectProvider<RabbitTemplate> rabbit) {
+                           ObjectProvider<RabbitTemplate> rabbit,
+                           MeterRegistry registry) {
         this.outbox = outbox;
         this.enabled = enabled;
         this.rabbit = rabbit;
+        Gauge.builder("logistpulse.outbox.pending", pendingCount, AtomicLong::get)
+                .description("Eventos del Outbox sin publicar (máx. 50 por pasada)").register(registry);
+        Gauge.builder("logistpulse.outbox.oldest.pending.seconds", oldestPendingSeconds, AtomicLong::get)
+                .description("Antigüedad del evento pendiente más viejo").register(registry);
     }
 
     /** Devuelve cuántos eventos se publicaron en esta pasada. */
@@ -55,7 +67,15 @@ public class OutboxPublisher {
             event.markSent(Instant.now());
             sent++;
         }
+        updateGauges(pending);
         return sent;
+    }
+
+    private void updateGauges(List<OutboxEvent> pending) {
+        List<OutboxEvent> remaining = pending.stream().filter(e -> e.getSentAt() == null).toList();
+        pendingCount.set(remaining.size());
+        oldestPendingSeconds.set(remaining.isEmpty() ? 0
+                : Duration.between(remaining.get(0).getCreatedAt(), Instant.now()).toSeconds());
     }
 
     private void send(OutboxEvent event) {

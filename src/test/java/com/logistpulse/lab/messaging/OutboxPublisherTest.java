@@ -11,6 +11,7 @@ import static org.mockito.Mockito.when;
 
 import com.logistpulse.lab.domain.OutboxEvent;
 import com.logistpulse.lab.repo.OutboxEventRepository;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -18,6 +19,7 @@ import org.springframework.beans.factory.ObjectProvider;
 
 class OutboxPublisherTest {
 
+    private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final OutboxEventRepository repo = mock(OutboxEventRepository.class);
     private final RabbitTemplate template = mock(RabbitTemplate.class);
     @SuppressWarnings("unchecked")
@@ -25,7 +27,7 @@ class OutboxPublisherTest {
 
     private OutboxPublisher publisher(boolean enabled) {
         when(provider.getObject()).thenReturn(template);
-        return new OutboxPublisher(repo, enabled, provider);
+        return new OutboxPublisher(repo, enabled, provider, registry);
     }
 
     private static OutboxEvent event(String payload) {
@@ -92,5 +94,26 @@ class OutboxPublisherTest {
         when(repo.findTop50BySentAtIsNullOrderByIdAsc()).thenReturn(List.of());
         assertThat(publisher(true).publishPending()).isZero();
         verify(template, never()).convertAndSend(any(String.class), any(Object.class));
+    }
+
+    @Test
+    void gaugesReflectWhatStaysPending() {
+        OutboxEvent a = event("1");
+        OutboxEvent b = event("2");
+        when(repo.findTop50BySentAtIsNullOrderByIdAsc()).thenReturn(List.of(a, b));
+        doThrow(new IllegalStateException("broker caído")).when(template).convertAndSend(any(String.class), any(Object.class));
+
+        publisher(true).publishPending();
+
+        assertThat(registry.get("logistpulse.outbox.pending").gauge().value()).isEqualTo(2.0);
+        assertThat(registry.get("logistpulse.outbox.oldest.pending.seconds").gauge().value()).isGreaterThanOrEqualTo(0.0);
+    }
+
+    @Test
+    void gaugesAreZeroWhenEverythingWasSent() {
+        when(repo.findTop50BySentAtIsNullOrderByIdAsc()).thenReturn(List.of(event("1")));
+        publisher(true).publishPending();
+        assertThat(registry.get("logistpulse.outbox.pending").gauge().value()).isZero();
+        assertThat(registry.get("logistpulse.outbox.oldest.pending.seconds").gauge().value()).isZero();
     }
 }
