@@ -116,6 +116,16 @@ public class OrderService {
         return OrderDto.from(order);
     }
 
+    /** Solo se pueden borrar pedidos CREATED (aún sin robot asignado). */
+    @Transactional
+    public void delete(Long id) {
+        Order order = find(id);
+        if (order.getStatus() != OrderStatus.CREATED) {
+            throw new ApiException(409, "Solo se pueden borrar pedidos CREATED; este está " + order.getStatus());
+        }
+        orders.delete(order);
+    }
+
     /** Transiciones restantes: IN_TRANSIT, DELIVERED, CANCELLED. Valida contra la máquina de estados. */
     @Transactional
     public OrderDto transition(Long id, OrderStatus to) {

@@ -24,6 +24,31 @@
 **★ `JerseyConfig`:** es el `ResourceConfig` de Jersey; registra explícitamente los recursos
 (`OrderResource`, `RobotResource`, `RouteResource`, `UiResource`) y los mappers de excepciones. Si olvido registrar un
 recurso, Jersey no lo conoce: sus rutas devuelven 404 aunque la clase compile y tenga `@Path`.
-(Pendiente de comprobar en ejecución cuando toque tocar `JerseyConfig` en la Parte 1.)
+Comprobado en la Parte 1: con `register(RobotResource.class)` comentado, `GET /api/robots/1` devolvió 404
+(página HTML de Tomcat) mientras `/api/orders/1` seguía respondiendo 200.
 
 **Qué no hice:** Modo B (Docker) no se probó en esta parte.
+
+## Parte 1 · Jersey / JAX-RS
+
+**Qué cambié:**
+- `RobotResource` + `RobotService.get`: `GET /api/robots/{id}` con `@PathParam`; 404 con `ApiException` si no existe.
+- `OrderResource` + `OrderService.delete`: `DELETE /api/orders/{id}`; 204 si el pedido está `CREATED`, 409 en otro estado, 404 si no existe.
+- `ConstraintViolationMapper` (nuevo, registrado en `JerseyConfig`): `ConstraintViolationException` → 400 con `{"status":400,"error":"Datos inválidos","fields":[{"field","message"}]}`.
+
+**Cómo lo probé** (Modo A, `curl` contra la app en marcha):
+| Petición | Resultado |
+|---|---|
+| `GET /api/robots/1` | 200 `AMR-01` |
+| `GET /api/robots/99` | 404 `Robot 99 no existe` |
+| `DELETE /api/orders/4` (CREATED) | 204; luego `GET` → 404 |
+| `DELETE /api/orders/1` (tras despacharlo, DISPATCHED) | 409 |
+| `DELETE /api/orders/999` | 404 |
+| `POST /api/orders` con `code:"mal"`, `customer:""`, `destX:-1` | 400 con 3 campos: `code`, `customer`, `destX` |
+
+**★ Equivalencias Jersey → Spring MVC** (a verificar y reescribir con mis palabras):
+- `@QueryParam` → `@RequestParam`
+- `@Context UriInfo` → `UriComponentsBuilder` / `ServletUriComponentsBuilder` (o `HttpServletRequest`)
+- `ExceptionMapper<E>` → `@ExceptionHandler` (dentro de un `@ControllerAdvice`)
+
+**Qué no hice:** no escribí tests automáticos para estos endpoints; la evidencia es manual con `curl`.
