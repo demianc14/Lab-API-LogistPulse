@@ -21,6 +21,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeSet;
 import java.util.UUID;
 import org.springframework.data.domain.Page;
@@ -29,6 +30,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class OrderService {
@@ -42,18 +44,20 @@ public class OrderService {
     private final RoutePlanner planner;
     private final CarrierClient carrier;
     private final DispatchEventPublisher events;
+    private final TransactionTemplate tx;
     private final Counter created;
     private final Counter dispatched;
 
     public OrderService(OrderRepository orders, RobotRepository robots, WarehouseRepository warehouses,
                         RoutePlanner planner, CarrierClient carrier, DispatchEventPublisher events,
-                        MeterRegistry registry) {
+                        TransactionTemplate tx, MeterRegistry registry) {
         this.orders = orders;
         this.robots = robots;
         this.warehouses = warehouses;
         this.planner = planner;
         this.carrier = carrier;
         this.events = events;
+        this.tx = tx;
         this.created = Counter.builder("logistpulse.orders.created").description("Pedidos creados").register(registry);
         this.dispatched = Counter.builder("logistpulse.orders.dispatched").description("Pedidos despachados").register(registry);
     }
@@ -123,11 +127,23 @@ public class OrderService {
 
     /**
      * CREATED → DISPATCHED: asigna el AMR libre con batería suficiente, calcula ruta y ETA y publica el evento.
-     * Ojo (ejercicio): hay una llamada HTTP al transportista dentro de la transacción.
+     *
+     * La llamada HTTP al transportista se hace ANTES de abrir la transacción (este método no es @Transactional):
+     * así no se retiene una conexión de la pool mientras se espera a un servicio externo lento.
+     * La parte de base de datos corre en una transacción corta (TransactionTemplate) que revalida todo.
      */
-    @Transactional
     public OrderDto dispatch(Long id) {
-        Order order = find(id);
+        Order order = find(id);   // lectura corta, su propia transacción
+        if (!order.getStatus().canGoTo(OrderStatus.DISPATCHED)) {   // evita llamar al transportista si ya es ilegal
+            throw new ApiException(409, "Transición ilegal " + order.getStatus() + " → DISPATCHED");
+        }
+        Optional<Integer> carrierEta = carrier.etaMinutes(order.getCode());   // HTTP, sin transacción abierta
+        return tx.execute(status -> dispatchInTx(id, carrierEta));
+    }
+
+    /** Parte transaccional del despacho: solo base de datos y cálculo local (A*), nada de red. */
+    private OrderDto dispatchInTx(Long id, Optional<Integer> carrierEta) {
+        Order order = find(id);   // se vuelve a leer y validar: el estado pudo cambiar durante la llamada HTTP
         if (!order.getStatus().canGoTo(OrderStatus.DISPATCHED)) {
             throw new ApiException(409, "Transición ilegal " + order.getStatus() + " → DISPATCHED");
         }
@@ -138,7 +154,7 @@ public class OrderService {
         Warehouse w = order.getWarehouse();
         RouteDto route = planner.plan(new Point(w.getOriginX(), w.getOriginY()),
                 new Point(order.getDestX(), order.getDestY()));
-        int eta = carrier.etaMinutes(order.getCode()).orElse(route.cost() * 2);
+        int eta = carrierEta.orElse(route.cost() * 2);
 
         order.setStatus(OrderStatus.DISPATCHED);
         order.setRobot(robot);

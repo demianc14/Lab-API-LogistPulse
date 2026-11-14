@@ -167,3 +167,36 @@ La regla de protección (no traer miles de filas con sus joins) pertenece a la c
 restricciones o tipos existentes; no probé si ahí `RETURNED` sería rechazado. Es un argumento para el proyecto de cierre con Flyway + `CHECK`.
 
 **Qué no hice:** la prueba de carrera es un script manual, no un test automático; no probé Modo B; no probé 3+ despachos simultáneos.
+
+## Parte 6 · RestClient y resiliencia
+
+**Entorno:** Modo C (API con Maven en el puerto **8081**, `SERVER_PORT=8081`, porque otro contenedor mío ocupa 127.0.0.1:8080; y solo `carrier-mock` = WireMock 3.9.1 en Docker).
+
+**Qué cambié:** `OrderService.dispatch` ya no es `@Transactional`. Ahora: (1) lee el pedido y comprueba que la transición es legal (para no llamar al transportista en vano),
+(2) llama a `CarrierClient.etaMinutes` **sin transacción abierta**, (3) ejecuta la parte de base de datos (`dispatchInTx`: revalidar estado, elegir AMR, planificar A*, actualizar, publicar evento)
+en una transacción corta con `TransactionTemplate`. Uso `TransactionTemplate` y no un segundo `@Transactional` porque una llamada interna dentro del mismo bean no pasa por el proxy y la anotación no se aplicaría.
+
+**6.1 `LP-SLOW1`** (medido): tarda **2,02 s** (WireMock tardaría 5 s; `CarrierClient` corta a los 2 s) y devuelve `etaMinutes: 36`.
+★ **¿Qué ETA queda y de dónde sale?** 36 = `route.cost()` (18, ruta A* de (0,0) a (11,7)) × 2: es el ETA local de respaldo de `OrderService`
+(`carrierEta.orElse(route.cost() * 2)`), no los 99 que respondería WireMock.
+★ **¿Se avisa en el log?** Sí, hay un `WARN` de `CarrierClient`: `Transportista no disponible para LP-SLOW1: I/O error on GET request … Request cancelled`. Pero es insuficiente:
+no dice que fue un timeout, ni que se usó un ETA estimado, y la respuesta de la API no distingue un ETA del transportista de uno estimado (ambos son `etaMinutes`).
+
+**6.2 Transportista apagado** (`docker compose stop carrier-mock`): el despacho responde `200` en **0,01 s** (conexión rechazada, falla rápido), ETA 36, log `…: null` (aún menos útil que el timeout).
+Al volver a encenderlo, el siguiente pedido recibió de nuevo ETA 25 en 0,25 s.
+
+**★ 6.3 Trampa: HTTP dentro de la transacción.** Riesgo: la transacción retiene una conexión de la pool de BD (Hikari, máx. 10 aquí) durante toda la espera al servicio externo (hasta 2 s por el timeout),
+aunque la conexión no haga nada. Con unas pocas peticiones lentas se agota la pool y el resto de la API, incluso endpoints sin relación, se queda esperando conexión. Además la transacción
+queda abierta más tiempo (más ventana para conflictos de `@Version` y, en Postgres, sesiones "idle in transaction").
+Medición (app nueva cada vez, 12 despachos `LP-SLOW01…12` simultáneos y un `GET /api/robots` lanzado 0,6 s después):
+| | Antes (HTTP dentro de la tx) | Después (HTTP antes de la tx) |
+|---|---|---|
+| `GET /api/robots` sin carga | 0,003 s | 0,003 s |
+| `GET /api/robots` con 12 despachos lentos | **1,47 s** | **0,008 s** |
+| Despacho más lento | **4,10 s** (12 > 10 conexiones: dos tandas de 2 s) | 2,10 s |
+Funcionalidad intacta: normal 200/ETA 25; `LP-SLOW99` 200/ETA 36 en 2,02 s; repetido 409 sin llamar a WireMock; inexistente 404. `mvn test`: 21 tests, 0 fallos.
+
+**Costes del diseño nuevo:** se puede consultar el ETA y luego fallar con 409 (sin AMR libre o conflicto de `@Version`): una llamada externa "desperdiciada".
+El ETA puede quedar algo desfasado respecto al momento del commit. El despacho sigue durando 2 s en el caso lento: el refactor protege la pool, no la latencia de esa petición.
+
+**Qué no hice:** el reto 6.4 (reintento con backoff solo para 5xx); no hay test automático (el test de Mockito de `dispatch` es de la Parte 9); las cifras de carga son de una sola ejecución en mi máquina.
