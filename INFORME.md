@@ -52,3 +52,31 @@ Comprobado en la Parte 1: con `register(RobotResource.class)` comentado, `GET /a
 - `ExceptionMapper<E>` → `@ExceptionHandler` (dentro de un `@ControllerAdvice`)
 
 **Qué no hice:** no escribí tests automáticos para estos endpoints; la evidencia es manual con `curl`.
+
+## Parte 2 · JPA e Hibernate (N+1)
+
+**Qué cambié:** `Order`: `@Table(indexes = @Index(name = "idx_orders_status", columnList = "status"))`.
+`OrderRepository` quedó igual que al inicio (quité y restauré `@EntityGraph` solo para medir).
+`spring.jpa.show-sql` lo activé por variable de entorno (`SPRING_JPA_SHOW_SQL=true`) para no dejarlo encendido en el repo.
+
+**Cómo lo medí:** app en Modo A con show-sql, 12 pedidos (3 semilla + 9 creados) y 4 despachados (ids 9–12, cada uno
+con un AMR distinto). Conté las líneas `select` que genera solo `GET /api/orders?size=10` (devuelve 10 pedidos):
+
+| Variante | Consultas SQL | Detalle |
+|---|---|---|
+| Con `@EntityGraph(warehouse, robot)` | **2** | 1 `select` con joins + 1 `count` de la paginación |
+| Sin `@EntityGraph` | **7** | 1 `select` de pedidos + 1 `count` + 1 `warehouse where id=?` + 4 `robot where id=?` |
+
+**★ ¿Cuántas consultas aparecen y por qué?** Sin el grafo, `warehouse` y `robot` son `LAZY`: la consulta de pedidos no los trae y
+`OrderDto.from` los toca al mapear, así que Hibernate lanza una consulta extra por cada asociación distinta aún no cargada
+(el almacén es uno solo y se reutiliza del contexto de persistencia; hubo 4 robots distintos). Es el patrón N+1: crece con
+el número de robots distintos de la página (máximo 1 + 1 + 1 + 10 con size=10, y 5 robots en este lab). Con `@EntityGraph` todo
+va en un `join` y el número de consultas deja de depender de los datos. (Las cifras dependen de mis datos de prueba; con
+otros datos el N cambia.)
+
+**Índice sobre `status`:** verificado en el arranque (`create index idx_orders_status on orders (status)`).
+Justificación: `findByStatus` y las consultas operativas filtran por estado. Con solo 5 valores la cardinalidad es baja,
+así que el índice solo ayuda cuando el estado buscado es raro (pocos pedidos vivos frente al histórico `DELIVERED`);
+con pocos datos como en el lab, no se nota. Costo: cada cambio de estado actualiza también el índice.
+
+**Qué no hice:** no medí tiempos ni usé `EXPLAIN`, así que no puedo afirmar que el índice mejore algo en este lab (H2 con 12 filas).

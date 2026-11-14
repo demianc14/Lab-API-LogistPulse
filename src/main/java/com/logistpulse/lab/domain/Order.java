@@ -8,6 +8,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
@@ -15,7 +16,9 @@ import java.time.Instant;
 
 /** "order" es palabra reservada en SQL, por eso la tabla se llama orders. */
 @Entity
-@Table(name = "orders")
+// Índice en status: el listado filtra por estado (findByStatus) y el negocio consulta sobre todo
+// los pedidos "vivos" (CREATED/DISPATCHED/IN_TRANSIT), que son pocos frente al histórico DELIVERED.
+@Table(name = "orders", indexes = @Index(name = "idx_orders_status", columnList = "status"))
 public class Order {
 
     @Id
