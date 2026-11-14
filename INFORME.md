@@ -200,3 +200,41 @@ Funcionalidad intacta: normal 200/ETA 25; `LP-SLOW99` 200/ETA 36 en 2,02 s; repe
 El ETA puede quedar algo desfasado respecto al momento del commit. El despacho sigue durando 2 s en el caso lento: el refactor protege la pool, no la latencia de esa petición.
 
 **Qué no hice:** el reto 6.4 (reintento con backoff solo para 5xx); no hay test automático (el test de Mockito de `dispatch` es de la Parte 9); las cifras de carga son de una sola ejecución en mi máquina.
+
+## Parte 7 · Mensajería, consistencia y Outbox
+
+**⚠ Lo que NO pude hacer: 7.1 y 7.2 en vivo.** Intenté levantar RabbitMQ con la imagen local `rabbitmq:3.13-management` (la del compose, `rabbitmq:4-management`, no está descargada y no quise bajarla)
+y el contenedor se detenía al arrancar con `Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces` (permisos del volumen en este Docker/OrbStack). Probé 3 variantes (cookie por variable, `tmpfs` con uid 999) con el mismo resultado.
+Por eso **no observé** el log `Flota recibió …` ni la cola `orders.dispatched` en la consola 15672, ni la acumulación de mensajes con el consumidor parado. Todo lo de esta parte se verificó en Modo A y con tests, no contra un broker real.
+
+**Qué cambié:**
+- `OutboxEvent` + `OutboxEventRepository` (tabla `outbox_event`: `type`, `payload`, `createdAt`, `sentAt` nulo hasta publicar).
+- `OrderService.dispatchInTx` ahora hace `outbox.save(new OutboxEvent("order.dispatched", id))` **dentro de la misma transacción** que el cambio de estado.
+- `OutboxPublisher` (`@Scheduled`, cada 1 s, configurable con `lab.outbox.poll-ms`): publica las pendientes en orden y las marca enviadas; si el broker falla, se detiene y reintenta en la siguiente pasada.
+  `@EnableScheduling` en `LabApplication`. Eliminé `DispatchEventPublisher` (quedaba sin uso).
+- `OrderService.startTransit` + `FleetListener`: el consumidor solo avanza `DISPATCHED → IN_TRANSIT`; en cualquier otro caso (duplicado, pedido ya avanzado/cancelado, inexistente) registra "ignorado" y confirma el mensaje.
+
+**★ 7.3 `afterCommit`: qué fallo evita y cuál sigue existiendo**
+- Evita publicar un evento de una transacción que **no** llegó a commit (rollback por conflicto `@Version`, error de BD) y que el consumidor lea el pedido antes de que el cambio sea visible.
+  Lo vi en la práctica con el camino "lite", que escribe el evento sin esperar al commit: en las 20 rondas concurrentes de la Parte 4 hubo **40 eventos para 20 despachos** (el perdedor, que hacía rollback, también "publicaba").
+- Sigue existiendo: si el proceso cae **entre el commit y el envío**, la BD dice `DISPATCHED` y el AMR `BUSY`, pero el evento se perdió: el pedido nunca pasa a `IN_TRANSIT` y nadie se entera.
+  (También es de esperar que, con el broker caído en el `afterCommit`, el cliente vea un error aunque el despacho ya esté confirmado; no lo comprobé.)
+
+**★ 7.4 Outbox** (medido en Modo A, mismas 20 rondas concurrentes): **20 despachos exitosos → 20 eventos, sin ids repetidos** (antes 40). Esto cierra la ventana del commit-envío: el evento queda
+confirmado junto con el cambio de estado y el publicador lo reintenta hasta lograr enviarlo.
+Límites del diseño: garantía **al menos una vez** (si cae tras enviar y antes de marcar `sentAt`, se reenvía → hace falta consumidor idempotente); la latencia añade hasta ~1 s del sondeo;
+las filas enviadas nunca se purgan (la tabla crece); no hay confirmaciones del publicador (`publisher confirms`); con varias instancias de la API haría falta `SELECT … FOR UPDATE SKIP LOCKED` para no enviar doble; sin índice en `sent_at`.
+
+**★ 7.5 Idempotencia: ¿qué pasa hoy si llega dos veces el mismo mensaje?**
+- El código original llamaba a `transition(id, IN_TRANSIT)`. La segunda vez el pedido ya está `IN_TRANSIT`, `canGoTo(IN_TRANSIT)` es falso (comprobado en `OrderStatusTest`: ningún estado se transita a sí mismo) y lanza `ApiException(409)` desde el listener.
+  Con la configuración por defecto de Spring AMQP, una excepción en el listener hace que el mensaje se **reencole y se reintente sin fin** (esto lo deduzco del comportamiento por defecto; **no lo observé** sin broker).
+- Ahora `startTransit` solo actúa si el estado es `DISPATCHED`; un duplicado devuelve `false`, se registra y se confirma. La guarda también protege de un mensaje obsoleto: sin ella, un pedido `DELIVERED` podría volver a `IN_TRANSIT`
+  (el test falla si quito la guarda; lo comprobé).
+- Si dos consumidores procesan el mismo mensaje a la vez, el `@Version` hace fallar a uno; esa excepción no se captura a propósito: el broker reentrega y el reintento ya ve el estado final (→ "ignorado").
+- No resuelto: un mensaje con payload no numérico seguiría reintentándose indefinidamente (no hay cola de mensajes muertos).
+
+**Tests nuevos** (`mvn test`: **32 tests, 0 fallos**; antes 21): `OutboxPublisherTest` (5: envía en orden y marca, broker caído deja pendiente, fallo a mitad de lote, modo lite, sin pendientes),
+`FleetListenerIdempotencyTest` (4), `DispatchOutboxTest` (2, con Spring + H2: un despacho exitoso crea un evento; los despachos rechazados —ya despachado, sin AMR— no crean ninguno).
+Nota: la primera versión de la prueba de integración se llamaba `…IT` y Surefire no la ejecutaba; la renombré a `…Test` y la corrí.
+
+**Qué no hice:** ver 7.1/7.2 con RabbitMQ real; probar el Outbox contra un broker (solo con mocks y modo lite); un test de que el evento se revierte si la transacción falla *después* del insert; purga de eventos enviados.

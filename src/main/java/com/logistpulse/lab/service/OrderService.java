@@ -6,12 +6,13 @@ import com.logistpulse.lab.api.dto.OrderInput;
 import com.logistpulse.lab.api.dto.PageDto;
 import com.logistpulse.lab.domain.Order;
 import com.logistpulse.lab.domain.OrderStatus;
+import com.logistpulse.lab.domain.OutboxEvent;
 import com.logistpulse.lab.domain.Robot;
 import com.logistpulse.lab.domain.RobotStatus;
 import com.logistpulse.lab.domain.Warehouse;
 import com.logistpulse.lab.integration.CarrierClient;
-import com.logistpulse.lab.messaging.DispatchEventPublisher;
 import com.logistpulse.lab.repo.OrderRepository;
+import com.logistpulse.lab.repo.OutboxEventRepository;
 import com.logistpulse.lab.repo.RobotRepository;
 import com.logistpulse.lab.repo.WarehouseRepository;
 import com.logistpulse.lab.route.Point;
@@ -43,20 +44,20 @@ public class OrderService {
     private final WarehouseRepository warehouses;
     private final RoutePlanner planner;
     private final CarrierClient carrier;
-    private final DispatchEventPublisher events;
+    private final OutboxEventRepository outbox;
     private final TransactionTemplate tx;
     private final Counter created;
     private final Counter dispatched;
 
     public OrderService(OrderRepository orders, RobotRepository robots, WarehouseRepository warehouses,
-                        RoutePlanner planner, CarrierClient carrier, DispatchEventPublisher events,
+                        RoutePlanner planner, CarrierClient carrier, OutboxEventRepository outbox,
                         TransactionTemplate tx, MeterRegistry registry) {
         this.orders = orders;
         this.robots = robots;
         this.warehouses = warehouses;
         this.planner = planner;
         this.carrier = carrier;
-        this.events = events;
+        this.outbox = outbox;
         this.tx = tx;
         this.created = Counter.builder("logistpulse.orders.created").description("Pedidos creados").register(registry);
         this.dispatched = Counter.builder("logistpulse.orders.dispatched").description("Pedidos despachados").register(registry);
@@ -162,7 +163,8 @@ public class OrderService {
         robot.setStatus(RobotStatus.BUSY);
 
         dispatched.increment();
-        events.publishAfterCommit(order.getId());
+        // Outbox: el evento se guarda en la MISMA transacción; OutboxPublisher lo enviará después.
+        outbox.save(new OutboxEvent("order.dispatched", String.valueOf(order.getId())));
         return OrderDto.from(order);
     }
 
@@ -174,6 +176,20 @@ public class OrderService {
             throw new ApiException(409, "Solo se pueden borrar pedidos CREATED; este está " + order.getStatus());
         }
         orders.delete(order);
+    }
+
+    /**
+     * Para el consumidor de eventos (idempotente): solo avanza DISPATCHED → IN_TRANSIT.
+     * Si el mensaje llega repetido o el pedido ya cambió (IN_TRANSIT, DELIVERED, CANCELLED…), no hace nada y devuelve false.
+     */
+    @Transactional
+    public boolean startTransit(Long id) {
+        Order order = orders.findById(id).orElse(null);
+        if (order == null || order.getStatus() != OrderStatus.DISPATCHED) {
+            return false;
+        }
+        order.setStatus(OrderStatus.IN_TRANSIT);
+        return true;
     }
 
     /** Transiciones restantes: IN_TRANSIT, DELIVERED, CANCELLED. Valida contra la máquina de estados. */
