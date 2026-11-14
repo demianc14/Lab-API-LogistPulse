@@ -119,3 +119,51 @@ puerta de entrada al servicio: otro recurso, un job o un test pueden llamar a `O
 La regla de protección (no traer miles de filas con sus joins) pertenece a la capa que ejecuta la consulta; el recurso solo traduce HTTP.
 
 **Qué no hice:** no hay tests de integración HTTP del filtro (la evidencia es `curl`); `sort` no es insensible a mayúsculas.
+
+## Parte 4 · Máquina de estados y concurrencia
+
+**Qué cambié:**
+- `OrderStatus`: nuevo estado `RETURNED`; `DELIVERED → RETURNED` y `RETURNED` es terminal (`DELIVERED` deja de serlo).
+- `index.html` (consola): color para `RETURNED` y se excluye de los pedidos "activos" del plano.
+- `OrderStatusTest`: de 4 a 10 tests (6 nuevos: entregado→devuelto, `RETURNED` terminal, solo `DELIVERED` puede ir a `RETURNED`,
+  la entrega no se deshace, nadie vuelve a `CREATED` ni a sí mismo, y la matriz completa de transiciones).
+  Actualicé `terminalStatesHaveNoExit`, que afirmaba que `DELIVERED` era terminal (contrato que cambió a propósito).
+- `mvn test`: 21 tests, 0 fallos.
+
+**Probado a mano (`curl`):** `CREATED→RETURNED` 409, `DISPATCHED→RETURNED` 409, `DELIVERED→RETURNED` 200,
+`RETURNED→DELIVERED` 409; el pedido devuelto no ofrece enlaces y sale con `?status=RETURNED`.
+
+**★ Concurrencia — dos despachos simultáneos** (script con dos `curl … &` + `wait`, 10 rondas):
+| Caso | Resultado en las 10 rondas |
+|---|---|
+| Mismo pedido, 2 despachos | siempre un `200` y un `409` (`Conflicto de concurrencia, reintenta la operación`); el ganador varía (a veces la 1ª petición, a veces la 2ª) |
+| Dos pedidos distintos | siempre un `200` (AMR-01) y un `409`; **nunca** dos pedidos con el mismo AMR |
+
+- **¿Cuál gana y qué recibe el perdedor?** Gana la transacción que hace commit primero; es impredecible. La otra falla al hacer `UPDATE … WHERE id=? AND version=?`
+  (0 filas afectadas) → `ObjectOptimisticLockingFailureException` → `OptimisticLockMapper` → `409`. En el caso "mismo pedido" cuenta el `@Version` de `Order` y/o el de `Robot`
+  (ambos buscan el mismo AMR); en el caso "pedidos distintos" lo para el `@Version` de `Robot`, porque ambos eligen el primer AMR libre (AMR-01) y solo uno puede cambiarlo a `BUSY`.
+  (Solo capturé el cuerpo del perdedor en una ronda del caso distinto: `Conflicto de concurrencia…`; en el resto solo anoté los códigos.)
+- **No logré provocar el mismo AMR en dos pedidos.** Pero la seguridad cuesta disponibilidad: el perdedor recibe 409 aunque AMR-02 estuviera libre; el cliente debe reintentar.
+- **Hallazgo — evento fantasma en Modo A:** el log mostró 40 líneas `evento order.dispatched` para 20 despachos exitosos. Con RabbitMQ desactivado,
+  `DispatchEventPublisher.publishAfterCommit` registra en el log **al instante**, sin esperar al commit, así que el perdedor (que hace rollback) también "publica".
+  Con RabbitMQ activo sí usa `afterCommit` y el perdedor no emitiría nada (no lo probé: requiere Modo B). No lo corregí; es material de la Parte 7.
+
+**★ Invariantes del sistema y si la BD las garantiza hoy** (DDL observado con `show-sql` en H2; `ddl-auto=update`):
+| # | Invariante | ¿La BD la garantiza? | Cómo se cumple hoy |
+|---|---|---|---|
+| 1 | `code` de pedido y de robot únicos | **Sí** | `UNIQUE` |
+| 2 | Pedido siempre con almacén; robot siempre con almacén; FK válidas | **Sí** | `NOT NULL` + `FOREIGN KEY` |
+| 3 | `status` solo toma valores válidos | **Sí** (en H2, columna `enum(...)`) | tipo enum de la BD; incluye `RETURNED` por ser una BD nueva |
+| 4 | Transiciones válidas (`CREATED→DISPATCHED→…`) | **No** | solo `OrderStatus.canGoTo` en Java; un `UPDATE` directo salta estados |
+| 5 | Un AMR `BUSY` tiene exactamente un pedido `DISPATCHED/IN_TRANSIT` | **No** | `OrderService` + `@Version` de `Robot` (lo vi aguantar 20 rondas) |
+| 6 | Un AMR no tiene dos pedidos activos a la vez | **No** | no hay índice único parcial sobre `robot_id` para estados activos; solo el bloqueo optimista |
+| 7 | Pedido `DISPATCHED/IN_TRANSIT` tiene robot (y `CREATED` no) | **No** | `robot_id` es nullable y sin `CHECK`; lo mantiene `dispatch`/`transition` |
+| 8 | Despachar exige AMR `IDLE` con batería ≥ 20 % | **No** | comprobación-y-luego-escritura en Java (`MIN_BATTERY`) |
+| 9 | Batería entre 0 y 100 | **No** | `Robot.setBattery` recorta; sin `CHECK` |
+| 10 | Solo se borra un pedido `CREATED`; destino dentro de la grilla y no bloqueado | **No** | `OrderService.delete` / `planner.isWalkable` (la grilla vive en memoria) |
+| 11 | Escrituras concurrentes sobre la misma fila no se pisan | **Parcial** | la columna `version` es de la BD, pero la lógica de comparar es de Hibernate |
+
+**Riesgo no verificado:** con `ddl-auto=update` sobre una base ya existente (p. ej. el volumen de Postgres del compose), Hibernate no modifica
+restricciones o tipos existentes; no probé si ahí `RETURNED` sería rechazado. Es un argumento para el proyecto de cierre con Flyway + `CHECK`.
+
+**Qué no hice:** la prueba de carrera es un script manual, no un test automático; no probé Modo B; no probé 3+ despachos simultáneos.
