@@ -320,3 +320,42 @@ Comprobé que los tests detectan fallos con 2 mutaciones temporales (ya revertid
 **Reto 9.4 (no hecho):** el `healthcheck` del servicio `api` en el compose. Dato relevante: el enunciado dice que la imagen JRE no tiene `curl`, pero en `eclipse-temurin:21-jre` **sí está** (`/usr/bin/curl`), así que `curl -fsS http://localhost:8080/actuator/health` serviría. Solo lo comprobé en esa imagen.
 
 **Qué no hice:** ejecutar el Runner de Postman; el reto 9.4; los tests de Postman cubren solo "Crear pedido" y "Listar pedidos".
+
+## Parte 5 · Rutas A*, Redis y métricas
+
+**Entorno:** stack Docker (Redis real); API en `localhost:8081`. En 5.1 no usé el plano de la consola web: dibujé las rutas en ASCII con `/api/routes` y `/api/routes/grid`.
+
+**5.1 Ruta por la zona congestionada vs rodeo** (con el costo original 5; `S` inicio, `G` destino, `*` ruta, `,` zona congestionada):
+- `(3,3) → (7,3)`: la línea recta cruza las 3 celdas `,` (3×5 + 1 = **16**); A* rodea por la fila 2 con costo **6**.
+- `(0,0) → (5,4)`, destino **dentro** de la zona: no se puede evitar; costo **15** (10 celdas × 1 + 5 de entrar a la celda congestionada).
+
+**5.2 Caché Redis** (medido con Redis real; `logistpulse_route_plan_seconds_count` en `/actuator/prometheus`):
+| Petición | Cálculos A* (contador) |
+|---|---|
+| antes | 7 |
+| 1.ª `(9,5)→(11,0)` | 8 |
+| 2.ª y 3.ª idénticas | 8, 8 (no suben) |
+| ruta distinta `(8,5)→(11,0)` | 9 |
+★ **¿Por qué solo sube la primera vez?** `RoutePlanner.plan` lleva `@Cacheable("routes")`: el proxy de Spring busca la clave `from.x:from.y>to.x:to.y` y, si existe, devuelve el valor guardado **sin ejecutar el método**.
+El `Timer` está dentro del método (`planTimer.record(...)`), así que solo mide los cálculos reales (cache-miss).
+Comprobado en Redis (`redis-cli keys '*'`): claves `routes::9:5>11:0`, etc.; `TTL` = 600 s (= `spring.cache.redis.time-to-live=10m`); el valor es un `RouteDto` con serialización Java (empieza con `\xac\xed`, por eso `RouteDto` y `Point` son `Serializable`).
+Hallazgo secundario: **los errores no se cachean**. Una ruta a una estantería (`(9,6)` es `#`) dio `422` las dos veces y el contador subió en cada una: cada reintento recalcula.
+(Mi intento de ver la caché a través de `dispatch` no sirvió: devolvió 409 por flota agotada, así que no lo cuento como evidencia.)
+
+**5.3 Costo de la zona congestionada de 5 a 2**
+- `WarehouseGrid`: constante `CONGESTED_COST = 2` (antes un `5` fijo en `cost()`).
+- `AStarPathfinderTest` (6 → 9 tests): actualicé el comentario del test del rodeo (directo 3×2 + 1 = 7, rodeo 6; el rodeo sigue ganando y el test pasa sin cambiar sus valores); y añadí
+  (a) `(3,0)→(5,5)`: ahora cuesta **9 y cruza la zona** (con costo 5 era 11 rodeando); (b) `(0,0)→(5,4)` cuesta **11** (antes 15); (c) A* da el costo óptimo en **todas** las parejas de celdas libres, comparado con un Dijkstra escrito en el test.
+  Mi primer (b) afirmaba que solo se pagaría la última celda congestionada; era falso con costo 2 (conviene cruzar dos) y lo corregí con el valor calculado por separado.
+- Los valores 9, 11 y 10 los verifiqué con un Dijkstra independiente en Python (fuera del repo). `mvn test`: **46 tests, 0 fallos**. Mutación: con heurística `3 × Manhattan` fallan 2 tests (el de optimalidad y el del rodeo).
+
+★ **¿Sigue siendo admisible la heurística Manhattan?** Sí. Una heurística es admisible si nunca sobreestima el costo real restante. El costo mínimo por celda sigue siendo **1** (los pasillos libres), y Manhattan es el número mínimo de pasos,
+así que `h ≤` costo real. Bajar la zona de 5 a 2 solo hace los caminos más baratos, pero nunca por debajo de 1 por paso. Lo respalda el test contra Dijkstra en las 76 × 76 parejas de celdas libres.
+★ **¿Y si el costo mínimo fuera 0,5?** Entonces Manhattan **sobreestima** (cada paso puede costar la mitad) y deja de ser admisible: A* ya no garantiza el óptimo. La corrección es usar `h = costo_mínimo × Manhattan` (0,5 × Manhattan).
+Pruebas (Python, fuera del repo): en esta grilla con zona a 0,5, **0 de 5700 pares** salen subóptimos (no encontré contraejemplo, la zona es pequeña); en una grilla de juguete 3×11 con un carril rápido de costo 0,5 el óptimo es **8,5** y A* con Manhattan devuelve **10**; con 0,5 × Manhattan vuelve a dar 8,5.
+Además, el código usa `int` para los costos: 0,5 exigiría `double` o escalar todo ×2 (no lo implementé).
+
+**Reto 5.5 (parcial: solo la observación, sin implementar la solución).** La caché no se invalida: tras reconstruir la API con costo 2, `(3,0)→(5,5)` devolvió **costo 11** desde Redis (calculado con costo 5, 485 s de TTL restante, 0 cálculos) cuando el óptimo ya es 9;
+una ruta nueva `(2,0)→(5,5)` dio 10 con 1 cálculo, y al borrar la clave a mano la ruta pasó a 9. Con TTL de 10 min, un cambio de plano deja rutas viejas hasta 10 min. Estrategia propuesta (no hecha): incluir una **versión del plano** en la clave (`v2:3:0>5:5`), de modo que cambiar el plano cambie las claves, y mantener el TTL como red de seguridad; `@CacheEvict(allEntries = true)` al reconfigurar el plano sirve si el plano cambia en caliente.
+
+**Qué no hice:** el reto 5.4 (8 vecinos con √2); implementar la invalidación de caché; usar el plano de la consola web.
