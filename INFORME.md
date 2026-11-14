@@ -359,3 +359,28 @@ Además, el código usa `int` para los costos: 0,5 exigiría `double` o escalar 
 una ruta nueva `(2,0)→(5,5)` dio 10 con 1 cálculo, y al borrar la clave a mano la ruta pasó a 9. Con TTL de 10 min, un cambio de plano deja rutas viejas hasta 10 min. Estrategia propuesta (no hecha): incluir una **versión del plano** en la clave (`v2:3:0>5:5`), de modo que cambiar el plano cambie las claves, y mantener el TTL como red de seguridad; `@CacheEvict(allEntries = true)` al reconfigurar el plano sirve si el plano cambia en caliente.
 
 **Qué no hice:** el reto 5.4 (8 vecinos con √2); implementar la invalidación de caché; usar el plano de la consola web.
+
+## Proyecto de cierre · Flyway + restricciones `CHECK` (ADR en `docs/adr/0001-flyway-y-restricciones-de-integridad.md`)
+
+**Qué cambié:** dependencias `spring-boot-starter-flyway` y `flyway-database-postgresql`; `ddl-auto=validate`; migraciones `V1` (esquema base), `V2` (4 `CHECK`) y `V3` (índice único parcial, solo PostgreSQL);
+`IntegrityViolationMapper` (unicidad → `409`, el resto → `500`) y su test; `DispatchOutboxTest` usa una BD H2 propia por contexto.
+
+**Antes** (BD Postgres real, transacciones con `ROLLBACK`): la BD **aceptó** (1) dos pedidos activos con el mismo AMR, (2) `DISPATCHED` sin robot, (3) `CREATED` con robot, (4) batería 150; solo rechazó un `status` inexistente.
+**Después** de migrar esa misma BD: las 4 se rechazan (`uk_orders_one_active_per_robot`, `orders_active_has_robot`, `orders_idle_states_have_no_robot`, `robot_battery_range`) y el control sigue rechazado.
+
+**Tres escenarios verificados:**
+| Escenario | Resultado |
+|---|---|
+| H2 (modo lite) | Flyway aplica V1+V2; `validate` pasa; `smoke.sh` ok (7 comprobaciones) |
+| Postgres con datos existentes (creado por Hibernate) | *baseline* en v1, aplica V2 y V3; historial `BASELINE, SQL, SQL`; datos previos revisados antes (0 filas incoherentes). Al reiniciar: "up to date" |
+| Postgres vacío | aplica V1–V3; índice parcial presente, 6 `CHECK`; semilla 5 robots / 3 pedidos; `smoke.sh` ok |
+Tras migrar: ciclo de vida completo (crear → despachar → `IN_TRANSIT` → `DELIVERED` → `RETURNED`) y cancelar un pedido en vuelo funcionan sin chocar con las restricciones. `mvn test`: **49 tests, 0 fallos**.
+
+**⚠ Regresión que introduje y corregí.** Con el índice parcial en Postgres, las 20 rondas concurrentes dieron **500 en 10 rondas** (las de pedidos distintos): el `UPDATE` de `orders` chocaba con el índice antes de que el `@Version` de `Robot` diera su conflicto,
+y la excepción (`DataIntegrityViolationException`, SQLState 23505) no tenía mapper. La BD sí evitó el doble reparto (nunca hubo dos pedidos con el mismo AMR). Añadí `IntegrityViolationMapper` y repetí: **20 rondas → 9 × `200/409` y 11 × `409/200`, 0 errores 500, máximo 1 pedido activo por robot, 0 `ERROR` en el log**.
+Esto no lo habría visto en H2 (no tiene el índice): es un ejemplo de que el modo lite y el stack completo no se comportan igual.
+
+**Actualización de la tabla de invariantes de la Parte 4:** ahora garantiza la BD → "un AMR no tiene dos pedidos activos" (**solo PostgreSQL**), "activo ⇒ tiene robot / `CREATED` y `CANCELLED` ⇒ sin robot", batería 0–100 y ETA ≥ 0.
+**Siguen sin estar garantizadas:** transiciones válidas, "`BUSY` ⇔ exactamente un pedido activo" (cruza dos tablas) y batería ≥ 20 % para despachar. El riesgo de la Parte 4 sobre `RETURNED` y `ddl-auto=update` queda resuelto por diseño, aunque no probé el caso concreto de una BD vieja con `CHECK` sin `RETURNED`.
+
+**Qué no hice / límites:** H2 queda con garantías más débiles (sin índice parcial); no probé una BD existente que difiera de `V1`; no hay tests automáticos de las migraciones contra Postgres (la verificación fue manual con Docker); no actualicé el README.

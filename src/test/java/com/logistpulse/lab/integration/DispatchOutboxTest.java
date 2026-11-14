@@ -16,6 +16,7 @@ import org.springframework.test.annotation.DirtiesContext;
 
 /** Parte 7.4: el evento nace con el cambio de estado (misma transacción) y solo si el despacho tuvo éxito. */
 @SpringBootTest(properties = {
+        "spring.datasource.url=jdbc:h2:mem:outbox-${random.uuid}",   // BD propia por contexto (con Flyway, compartirla entre contextos fallaba)
         "lab.outbox.poll-ms=3600000",                  // el planificador no interfiere: publico a mano
         "lab.carrier.base-url=http://localhost:1"})    // transportista inalcanzable: cae al ETA local, rápido
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
