@@ -80,3 +80,42 @@ así que el índice solo ayuda cuando el estado buscado es raro (pocos pedidos v
 con pocos datos como en el lab, no se nota. Costo: cada cambio de estado actualiza también el índice.
 
 **Qué no hice:** no medí tiempos ni usé `EXPLAIN`, así que no puedo afirmar que el índice mejore algo en este lab (H2 con 12 filas).
+
+## Parte 3 · Spring Data, paginación y HATEOAS
+
+**Qué cambié:**
+- `OrderRepository`: `findByCustomerNameContainingIgnoreCase` y `findByStatusAndCustomerNameContainingIgnoreCase` (ambos con `@EntityGraph`).
+- `OrderService.list(status, customer, sort, page, size)`: elige el método según haya `customer`/`status`; `parseSort` valida `?sort=campo[,asc|desc]`
+  contra la lista blanca `SORTABLE` (`id, code, customer, status, createdAt, etaMinutes`; `customer` se mapea a `customerName`).
+  Un campo o dirección inválidos → `ApiException(400)`. Siempre se añade `id desc` como desempate.
+- `OrderResource.list`: nuevos `@QueryParam("customer")` y `@QueryParam("sort")`; los enlaces `self/first/prev/next/last` conservan ambos.
+- Test nuevo `OrderSortTest` (5 tests sobre `parseSort`).
+
+**Cómo lo probé** (`curl` con la app en marcha + `mvn test`: 15 tests, 0 fallos; antes eran 10):
+| Petición | Resultado |
+|---|---|
+| `?customer=ALFA` | 200, 2 pedidos ("Alfa Market", "alfa ferretería"): no distingue mayúsculas |
+| `?customer=zETa&status=DISPATCHED` | 200, 1 pedido (Zeta Foods) |
+| `?customer=nadie` | 200, lista vacía |
+| `?customer=%` | 200, lista vacía: el `%` se escapa, no actúa como comodín |
+| `?sort=createdAt,desc&size=2&customer=a` | 200; el enlace `next` conserva `customer` y `sort` |
+| `?sort=password,desc` | 400 con los campos permitidos |
+| `?sort=id,sideways` / `?sort=createdAt,asc,x` | 400 |
+
+**Limitación vista:** `sort=customer` ordena por valor binario en H2 (mayúsculas antes que minúsculas: "alfa ferretería" quedó después de "Zeta Foods").
+
+**★ Grafo de estados y enlaces de `OrderDto`** (enlaces observados en respuestas reales; todos llevan además `self` y `collection`):
+```
+CREATED  [dispatch, to-cancelled] ──dispatch──▶ DISPATCHED [to-in_transit, to-cancelled] ──▶ IN_TRANSIT [to-delivered] ──▶ DELIVERED []
+   │                                                  │
+   └──────────────── to-cancelled ───────────────────┴──▶ CANCELLED []
+```
+`dispatch` tiene su propio endpoint (`POST /{id}/dispatch`); el resto de `to-*` apuntan a `POST /{id}/transitions` con `{"to": ...}`.
+Los enlaces salen de `OrderStatus.next()` en `OrderResource.linked`, así que cliente y servidor comparten la misma máquina de estados.
+Observación: `DELETE` solo funciona en `CREATED` pero no se anuncia como enlace.
+
+**Reto: ¿por qué `size` se limita a 100 en el servicio y no solo en el recurso?** (respuesta mía, a reescribir) El recurso no es la única
+puerta de entrada al servicio: otro recurso, un job o un test pueden llamar a `OrderService.list` directamente y saltarse el límite.
+La regla de protección (no traer miles de filas con sus joins) pertenece a la capa que ejecuta la consulta; el recurso solo traduce HTTP.
+
+**Qué no hice:** no hay tests de integración HTTP del filtro (la evidencia es `curl`); `sort` no es insensible a mayúsculas.

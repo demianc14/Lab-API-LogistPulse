@@ -20,6 +20,8 @@ import com.logistpulse.lab.route.RoutePlanner;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
 import java.util.UUID;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -77,14 +79,46 @@ public class OrderService {
         return OrderDto.from(find(id));
     }
 
+    /** Campos por los que se puede ordenar (nombre público → propiedad de la entidad). */
+    private static final Map<String, String> SORTABLE = Map.of(
+            "id", "id", "code", "code", "customer", "customerName",
+            "status", "status", "createdAt", "createdAt", "etaMinutes", "etaMinutes");
+
     @Transactional(readOnly = true)
-    public PageDto<OrderDto> list(OrderStatus status, int page, int size) {
+    public PageDto<OrderDto> list(OrderStatus status, String customer, String sort, int page, int size) {
         int safeSize = Math.min(Math.max(size, 1), 100);
         int safePage = Math.max(page, 0);
-        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by("id").descending());
-        Page<Order> result = status == null ? orders.findAll(pageable) : orders.findByStatus(status, pageable);
+        Pageable pageable = PageRequest.of(safePage, safeSize, parseSort(sort));
+        boolean byCustomer = customer != null && !customer.isBlank();
+        Page<Order> result;
+        if (byCustomer) {
+            result = status == null
+                    ? orders.findByCustomerNameContainingIgnoreCase(customer.trim(), pageable)
+                    : orders.findByStatusAndCustomerNameContainingIgnoreCase(status, customer.trim(), pageable);
+        } else {
+            result = status == null ? orders.findAll(pageable) : orders.findByStatus(status, pageable);
+        }
         List<OrderDto> content = result.getContent().stream().map(OrderDto::from).toList();
-        return new PageDto<>(content, safePage, safeSize, result.getTotalElements(), result.getTotalPages(), java.util.Map.of());
+        return new PageDto<>(content, safePage, safeSize, result.getTotalElements(), result.getTotalPages(), Map.of());
+    }
+
+    /** "campo[,asc|desc]" validado contra la lista blanca; el id desempata para que la paginación sea estable. */
+    static Sort parseSort(String sort) {
+        if (sort == null || sort.isBlank()) {
+            return Sort.by("id").descending();
+        }
+        String[] parts = sort.split(",", -1);
+        String property = SORTABLE.get(parts[0].trim());
+        if (property == null || parts.length > 2) {
+            throw new ApiException(400, "sort inválido '" + sort + "'. Campos permitidos: "
+                    + new TreeSet<>(SORTABLE.keySet()) + ", formato campo[,asc|desc]");
+        }
+        String dir = parts.length == 2 ? parts[1].trim().toLowerCase() : "asc";
+        if (!dir.equals("asc") && !dir.equals("desc")) {
+            throw new ApiException(400, "Dirección de sort inválida '" + parts[1] + "' (usa asc o desc)");
+        }
+        Sort primary = Sort.by(dir.equals("desc") ? Sort.Direction.DESC : Sort.Direction.ASC, property);
+        return property.equals("id") ? primary : primary.and(Sort.by("id").descending());
     }
 
     /**
