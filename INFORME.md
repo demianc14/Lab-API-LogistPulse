@@ -287,3 +287,36 @@ Verificado con RabbitMQ parado: pendientes = 1 y antigüedad 17 s → 27 s; al a
 
 **Qué no hice:** el reto 8.6 (gauge por estado y alerta "AMR libres = 0 durante 1 min"); arreglar `FleetMetrics` y el `CacheErrorHandler`; capturas de Grafana; repetir cada caos más de una vez; ver Grafana (solo comprobé por su API que cargó los 8 paneles).
 `mvn test`: **36 tests, 0 fallos** (+2 del Outbox, +2 de `HttpMetricsFilter`).
+
+## Parte 9 · Pruebas y contenedores
+
+**9.1 Postman** (`postman/logistpulse.postman_collection.json`). La colección ya traía tests de `201` y un `Location` flojo (`include('/api/orders/')`) en "Crear pedido". Añadí 3 tests nuevos que no se solapan con esos:
+| Test nuevo | Dónde | Qué comprueba |
+|---|---|---|
+| Código de estado | "Listar pedidos" (no tenía ninguno) | `200` y `Content-Type` con `application/json` |
+| `Location` | "Crear pedido" | es **exactamente** `{{host}}/api/orders/<id del cuerpo>` |
+| Esquema | "Crear pedido" | `pm.response.to.have.jsonSchema(...)`: campos obligatorios y tipos del `OrderDto`, `code` con patrón `^LP-`, `status` = `CREATED`, `robot`/`etaMinutes` nulos permitidos, `links` con `self`, `collection`, `dispatch` |
+**⚠ No ejecuté el Runner de Postman** (es gráfico y no tengo `newman`; no quise descargarlo sin permiso). Lo que sí verifiqué: el JSON de la colección es válido; los 8 scripts pasan `node --check`;
+y contra una respuesta real de la API (`POST /api/orders` → `201`, `Location: http://localhost:8081/api/orders/60`) el `Location` coincide exacto y el cuerpo cumple el esquema (comprobado con un verificador a mano de `required`, tipos, patrón y `enum`, **no** con Ajv, que es lo que usa Postman).
+Cambié un test mío antes de dar esto por bueno: usaba `have.header(nombre, /regex/)` y no estoy seguro de que Postman acepte regex ahí; lo sustituí por `expect(headers.get(...)).to.include(...)`.
+Nota: la variable `host` de la colección vale `http://localhost:8080`; en esta máquina 8080 es de otro proyecto, así que en el Runner hay que poner `host = http://localhost:8081`.
+
+**9.2 Test de Mockito de `OrderService.dispatch`** (`OrderServiceDispatchTest`, 7 tests, sin BD ni red):
+- sin robots → `409 "No hay AMR disponible…"` y el pedido sigue `CREATED`, sin evento en el Outbox;
+- pedido ya despachado → `409 "DISPATCHED → DISPATCHED"` y **no** se llama al transportista;
+- con el ETA caído (`Optional.empty()`) → `etaMinutes = route.cost() * 2` (18 × 2 = 36), pedido `DISPATCHED`, robot `BUSY`;
+- extras: si el transportista responde se usa su ETA (25); el despacho exitoso guarda el evento `order.dispatched` y hace commit; el transportista se consulta **antes** de abrir la transacción (`InOrder`, protege el refactor de la Parte 6); pedido inexistente → `404`.
+Comprobé que los tests detectan fallos con 2 mutaciones temporales (ya revertidas): cambiar `cost() * 2` por `cost()` hace fallar el test del ETA; quitar la validación previa de estado hace fallar el de "no llama al transportista".
+`mvn test`: **43 tests, 0 fallos**.
+
+**★ 9.3 Dockerfile** (respuestas basadas en la imagen que construimos con `docker compose`):
+- **¿Por qué dos etapas?** La primera (`maven:3.9-eclipse-temurin-21`) compila; la segunda (`eclipse-temurin:21-jre`) solo ejecuta y recibe únicamente `app.jar`. Así la imagen final no lleva Maven, ni compilador, ni el código fuente, ni la caché de dependencias.
+  Lo comprobé dentro del contenedor: `mvn` y `javac` no están (solo JRE). No pude comparar tamaños (la imagen de compilación no quedó en la lista local de Docker); la final pesa 626 MB.
+- **¿Qué se cachea con `dependency:go-offline`?** Se copia solo el `pom.xml` y se descargan todas las dependencias en una capa propia; mientras el `pom.xml` no cambie, Docker reutiliza esa capa y no vuelve a descargarlas.
+  Lo comprobé: tras cambiar solo un archivo de `src/`, en la reconstrucción `COPY pom.xml` y `RUN mvn … dependency:go-offline` salieron `CACHED`, y solo se repitieron `COPY src` y `mvn package`.
+- **¿Por qué `USER appuser`?** Para que el proceso no corra como root. Dentro del contenedor el proceso 1 es `appuser` (uid 999) y `/app` es de root: `touch /app/prueba` da `Permission denied`, o sea que una app comprometida no puede modificar el jar ni su carpeta, y no tiene privilegios de root dentro del contenedor.
+  Es una capa de defensa, no una garantía total (no impide por sí solo un escape del contenedor).
+
+**Reto 9.4 (no hecho):** el `healthcheck` del servicio `api` en el compose. Dato relevante: el enunciado dice que la imagen JRE no tiene `curl`, pero en `eclipse-temurin:21-jre` **sí está** (`/usr/bin/curl`), así que `curl -fsS http://localhost:8080/actuator/health` serviría. Solo lo comprobé en esa imagen.
+
+**Qué no hice:** ejecutar el Runner de Postman; el reto 9.4; los tests de Postman cubren solo "Crear pedido" y "Listar pedidos".
